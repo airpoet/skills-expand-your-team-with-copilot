@@ -5,6 +5,111 @@ Falls back to in-memory storage when MongoDB is not available
 
 from argon2 import PasswordHasher
 
+
+class MockCollection:
+    """Mock MongoDB collection for in-memory storage during development"""
+    def __init__(self, data_dict):
+        self.data = data_dict
+    
+    def find(self, query=None):
+        if query is None:
+            return [{"_id": k, **v} for k, v in self.data.items()]
+        
+        results = []
+        for key, value in self.data.items():
+            if self._match_query(value, query):
+                results.append({"_id": key, **value})
+        return results
+    
+    def find_one(self, query):
+        if isinstance(query, dict) and "_id" in query:
+            key = query["_id"]
+            if key in self.data:
+                return {"_id": key, **self.data[key]}
+            return None
+        
+        for key, value in self.data.items():
+            if self._match_query(value, query):
+                return {"_id": key, **value}
+        return None
+    
+    def insert_one(self, doc):
+        key = doc.pop("_id")
+        self.data[key] = doc
+        return type('Result', (), {'inserted_id': key})()
+    
+    def update_one(self, filter_query, update_query):
+        if "_id" in filter_query:
+            key = filter_query["_id"]
+            if key in self.data:
+                if "$push" in update_query:
+                    for field, value in update_query["$push"].items():
+                        if field not in self.data[key]:
+                            self.data[key][field] = []
+                        self.data[key][field].append(value)
+                elif "$pull" in update_query:
+                    for field, value in update_query["$pull"].items():
+                        if field in self.data[key] and isinstance(self.data[key][field], list):
+                            self.data[key][field] = [x for x in self.data[key][field] if x != value]
+                return type('Result', (), {'modified_count': 1})()
+        return type('Result', (), {'modified_count': 0})()
+    
+    def count_documents(self, query=None):
+        if query is None:
+            return len(self.data)
+        count = 0
+        for value in self.data.values():
+            if self._match_query(value, query):
+                count += 1
+        return count
+    
+    def aggregate(self, pipeline):
+        # Simple aggregation for getting unique days
+        if len(pipeline) >= 2 and "$unwind" in pipeline[0] and "$group" in pipeline[1]:
+            days = set()
+            for value in self.data.values():
+                if "schedule_details" in value and "days" in value["schedule_details"]:
+                    for day in value["schedule_details"]["days"]:
+                        days.add(day)
+            return [{"_id": day} for day in sorted(days)]
+        return []
+    
+    def _match_query(self, doc, query):
+        for key, condition in query.items():
+            if "." in key:
+                # Handle nested fields like "schedule_details.days"
+                parts = key.split(".")
+                value = doc
+                for part in parts:
+                    if part in value:
+                        value = value[part]
+                    else:
+                        return False
+                
+                if isinstance(condition, dict):
+                    if "$in" in condition:
+                        target_list = condition["$in"]
+                        if isinstance(value, list):
+                            if not any(item in target_list for item in value):
+                                return False
+                        else:
+                            if value not in target_list:
+                                return False
+                    elif "$gte" in condition:
+                        if value < condition["$gte"]:
+                            return False
+                    elif "$lte" in condition:
+                        if value > condition["$lte"]:
+                            return False
+                else:
+                    if value != condition:
+                        return False
+            else:
+                if key not in doc or doc[key] != condition:
+                    return False
+        return True
+
+
 # Try to connect to MongoDB, fallback to in-memory storage
 try:
     from pymongo import MongoClient
@@ -22,109 +127,7 @@ except Exception as e:
     # In-memory storage
     activities_data = {}
     teachers_data = {}
-
-    class MockCollection:
-        def __init__(self, data_dict):
-            self.data = data_dict
-        
-        def find(self, query=None):
-            if query is None:
-                return [{"_id": k, **v} for k, v in self.data.items()]
-            
-            results = []
-            for key, value in self.data.items():
-                if self._match_query(value, query):
-                    results.append({"_id": key, **value})
-            return results
-        
-        def find_one(self, query):
-            if isinstance(query, dict) and "_id" in query:
-                key = query["_id"]
-                if key in self.data:
-                    return {"_id": key, **self.data[key]}
-                return None
-            
-            for key, value in self.data.items():
-                if self._match_query(value, query):
-                    return {"_id": key, **value}
-            return None
-        
-        def insert_one(self, doc):
-            key = doc.pop("_id")
-            self.data[key] = doc
-            return type('Result', (), {'inserted_id': key})()
-        
-        def update_one(self, filter_query, update_query):
-            if "_id" in filter_query:
-                key = filter_query["_id"]
-                if key in self.data:
-                    if "$push" in update_query:
-                        for field, value in update_query["$push"].items():
-                            if field not in self.data[key]:
-                                self.data[key][field] = []
-                            self.data[key][field].append(value)
-                    elif "$pull" in update_query:
-                        for field, value in update_query["$pull"].items():
-                            if field in self.data[key] and isinstance(self.data[key][field], list):
-                                self.data[key][field] = [x for x in self.data[key][field] if x != value]
-                    return type('Result', (), {'modified_count': 1})()
-            return type('Result', (), {'modified_count': 0})()
-        
-        def count_documents(self, query=None):
-            if query is None:
-                return len(self.data)
-            count = 0
-            for value in self.data.values():
-                if self._match_query(value, query):
-                    count += 1
-            return count
-        
-        def aggregate(self, pipeline):
-            # Simple aggregation for getting unique days
-            if len(pipeline) >= 2 and "$unwind" in pipeline[0] and "$group" in pipeline[1]:
-                days = set()
-                for value in self.data.values():
-                    if "schedule_details" in value and "days" in value["schedule_details"]:
-                        for day in value["schedule_details"]["days"]:
-                            days.add(day)
-                return [{"_id": day} for day in sorted(days)]
-            return []
-        
-        def _match_query(self, doc, query):
-            for key, condition in query.items():
-                if "." in key:
-                    # Handle nested fields like "schedule_details.days"
-                    parts = key.split(".")
-                    value = doc
-                    for part in parts:
-                        if part in value:
-                            value = value[part]
-                        else:
-                            return False
-                    
-                    if isinstance(condition, dict):
-                        if "$in" in condition:
-                            target_list = condition["$in"]
-                            if isinstance(value, list):
-                                if not any(item in target_list for item in value):
-                                    return False
-                            else:
-                                if value not in target_list:
-                                    return False
-                        elif "$gte" in condition:
-                            if value < condition["$gte"]:
-                                return False
-                        elif "$lte" in condition:
-                            if value > condition["$lte"]:
-                                return False
-                    else:
-                        if value != condition:
-                            return False
-                else:
-                    if key not in doc or doc[key] != condition:
-                        return False
-            return True
-
+    
     # Create mock collections
     activities_collection = MockCollection(activities_data)
     teachers_collection = MockCollection(teachers_data)
